@@ -13,6 +13,8 @@ sessions are silos. The official experimental
 lead-spawned teammates, but nothing connects two sessions you *already* have
 open in different projects. This does.
 
+![Two Claude Code sessions talking live](docs/demo.gif)
+
 ```text
 ┌─ session A (your api repo) ─┐         ┌─ session B (your frontend repo) ─┐
 │ > /coordinate ask frontend  │  live   │ ▌ coordination message arrived    │
