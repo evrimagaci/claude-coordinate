@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""claude-coordinate — list, live-watch, and message Claude Code sessions on this machine.
+
+Read-only by default: `list` and `watch` only read the append-only session
+transcripts under ~/.claude/projects/. `send` appends a turn to a session via
+`claude -p --resume` (context-aware continuation) and prints the reply.
+
+Targets are resolved as:
+  1. a session UUID or unique UUID prefix (across all projects), else
+  2. a substring of the project directory path (e.g. "browser-orchestrator",
+     "my-api-project") -> the most recently active session in that project.
+
+Konsole tab names are NOT addressable (no tab->session mapping exists);
+use the project name instead.
+
+Usage:
+  claude-coordinate list [-n N] [--all]
+  claude-coordinate watch <target> [--history N] [--thinking] [--no-follow]
+  claude-coordinate send <target> <message...> [--force]
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$")
+# A transcript written to within this window counts as "actively in use".
+BUSY_WINDOW_S = 90
+
+C = {k: (v if sys.stdout.isatty() else "") for k, v in dict(
+    dim="\033[2m", bold="\033[1m", cyan="\033[36m", green="\033[32m",
+    yellow="\033[33m", red="\033[31m", reset="\033[0m").items()}
+
+
+def iter_sessions():
+    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        name = os.path.basename(path)
+        if not UUID_RE.match(name):
+            continue  # agent-*.jsonl sidechains, etc.
+        yield path
+
+
+def session_meta(path):
+    """Cheap metadata: cwd + first real user prompt gist from the head of the file."""
+    cwd, gist = None, None
+    try:
+        with open(path) as f:
+            for _ in range(50):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    j = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = cwd or j.get("cwd")
+                if gist is None and j.get("type") == "user":
+                    content = (j.get("message") or {}).get("content")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = next((c.get("text", "") for c in content
+                                     if isinstance(c, dict) and c.get("type") == "text"), "")
+                    else:
+                        text = ""
+                    text = " ".join(text.split())
+                    if text and not text.startswith("<"):
+                        gist = text[:90]
+                if cwd and gist:
+                    break
+    except OSError:
+        pass
+    return cwd, gist
+
+
+def claude_proc_cwds():
+    cwds = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if "claude" not in f.read():
+                    continue
+            cwds.add(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            continue
+    return cwds
+
+
+def collect(n=None, include_stale=False):
+    rows = []
+    now = time.time()
+    for path in iter_sessions():
+        mtime = os.path.getmtime(path)
+        if not include_stale and now - mtime > 7 * 86400:
+            continue
+        rows.append({"path": path, "sid": os.path.basename(path)[:-6], "mtime": mtime})
+    rows.sort(key=lambda r: -r["mtime"])
+    if n:
+        rows = rows[:n]
+    proc_cwds = claude_proc_cwds()
+    for r in rows:
+        cwd, gist = session_meta(r["path"])
+        r["cwd"], r["gist"] = cwd, gist
+        r["busy"] = time.time() - r["mtime"] < BUSY_WINDOW_S
+        r["proc"] = bool(cwd and cwd in proc_cwds)
+    return rows
+
+
+def resolve(target):
+    rows = collect(include_stale=True)
+    hits = [r for r in rows if r["sid"].startswith(target.lower())]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        sys.exit(f"ambiguous session-id prefix {target!r} ({len(hits)} matches)")
+    t = target.lower()
+    hits = [r for r in rows if t in os.path.basename(r["path"]).lower()
+            or t in (r["cwd"] or "").lower()
+            or t in os.path.dirname(r["path"]).lower()]
+    if not hits:
+        sys.exit(f"no session matches {target!r} (try `claude-coordinate list`)")
+    return hits[0]  # rows already sorted: freshest session in that project
+
+
+def age(ts):
+    d = int(time.time() - ts)
+    for unit, sec in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= sec:
+            return f"{d // sec}{unit}"
+    return f"{d}s"
+
+
+def cmd_list(args):
+    rows = collect(n=args.n, include_stale=args.all)
+    if not rows:
+        print("no sessions found")
+        return
+    for r in rows:
+        state = (f"{C['green']}ACTIVE{C['reset']}" if r["busy"]
+                 else f"{C['yellow']}open{C['reset']}" if r["proc"] else f"{C['dim']}idle{C['reset']}")
+        print(f"{C['cyan']}{r['sid'][:8]}{C['reset']}  {state:<6}  {age(r['mtime']):>4}  "
+              f"{C['bold']}{r['cwd'] or os.path.dirname(r['path'])}{C['reset']}")
+        if r["gist"]:
+            print(f"{C['dim']}          {r['gist']}{C['reset']}")
+
+
+def render(j, show_thinking):
+    typ = j.get("type")
+    if typ not in ("user", "assistant"):
+        return
+    msg = j.get("message") or {}
+    content = msg.get("content")
+    who = f"{C['green']}assistant{C['reset']}" if typ == "assistant" else f"{C['cyan']}user{C['reset']}"
+    if isinstance(content, str):
+        body = content.strip()
+        if body and not body.startswith("<"):
+            print(f"\n{C['bold']}── {who} ──{C['reset']}\n{body[:4000]}")
+        return
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        ct = c.get("type")
+        if ct == "text" and c.get("text", "").strip():
+            print(f"\n{C['bold']}── {who} ──{C['reset']}\n{c['text'][:4000]}")
+        elif ct == "thinking" and show_thinking:
+            t = " ".join(c.get("thinking", "").split())[:300]
+            print(f"{C['dim']}  [thinking] {t}{C['reset']}")
+        elif ct == "tool_use":
+            arg = json.dumps(c.get("input", {}), ensure_ascii=False)[:160]
+            print(f"{C['yellow']}  [{c.get('name')}]{C['reset']} {C['dim']}{arg}{C['reset']}")
+        elif ct == "tool_result":
+            body = c.get("content")
+            if isinstance(body, list):
+                body = " ".join(x.get("text", "") for x in body if isinstance(x, dict))
+            body = " ".join(str(body or "").split())[:200]
+            print(f"{C['dim']}    -> {body}{C['reset']}")
+
+
+def cmd_watch_all(args):
+    """One feed for every session: follow all transcripts from EOF, prefix
+    each turn with its project; pick up newly created sessions as they appear."""
+    print(f"{C['bold']}watching ALL sessions on this machine{C['reset']} "
+          f"{C['dim']}(new turns only; Ctrl-C to stop; read-only){C['reset']}")
+    handles = {}
+
+    def label(path):
+        cwd, _ = session_meta(path)
+        name = os.path.basename(cwd) if cwd else os.path.basename(os.path.dirname(path))
+        return f"{name}:{os.path.basename(path)[:8]}"
+
+    def attach(path, seek_end=True):
+        try:
+            f = open(path)
+            if seek_end:
+                f.seek(0, 2)
+            handles[path] = (f, label(path))
+        except OSError:
+            pass
+
+    for path in iter_sessions():
+        attach(path)
+    last_scan = time.time()
+    try:
+        while True:
+            wrote = False
+            for path, (f, tag) in list(handles.items()):
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        j = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if j.get("type") in ("user", "assistant"):
+                        print(f"{C['cyan']}┌─[{tag}]{C['reset']}", end="")
+                        render(j, args.thinking)
+                        wrote = True
+            if time.time() - last_scan > 5:
+                last_scan = time.time()
+                for path in iter_sessions():
+                    if path not in handles:
+                        attach(path, seek_end=False)
+            if not wrote:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        print(f"\n{C['dim']}stopped{C['reset']}")
+
+
+def cmd_watch(args):
+    if args.target == "--all" or args.all:
+        return cmd_watch_all(args)
+    r = resolve(args.target)
+    print(f"{C['bold']}watching {r['sid']} in {r['cwd']}{C['reset']} "
+          f"{C['dim']}(Ctrl-C to stop; read-only){C['reset']}")
+    with open(r["path"]) as f:
+        lines = f.readlines()
+        for line in lines[-args.history * 3:]:
+            try:
+                render(json.loads(line), args.thinking)
+            except json.JSONDecodeError:
+                pass
+        if args.no_follow:
+            return
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                try:
+                    render(json.loads(line), args.thinking)
+                except json.JSONDecodeError:
+                    pass
+        except KeyboardInterrupt:
+            print(f"\n{C['dim']}stopped{C['reset']}")
+
+
+CHANNEL_STATE = os.path.expanduser("~/.claude/channels/coordinate")
+
+
+def live_channels():
+    """Registry entries of running claude sessions that have the coordinate
+    channel attached (stale entries — dead pids — are ignored)."""
+    out = []
+    for f in glob.glob(os.path.join(CHANNEL_STATE, "sessions", "*.json")):
+        try:
+            j = json.load(open(f))
+            os.kill(int(j["pid"]), 0)  # alive?
+            out.append(j)
+        except (OSError, ValueError, KeyError):
+            continue
+    out.sort(key=lambda j: j.get("started", ""), reverse=True)
+    return out
+
+
+def send_via_channel(chan, msg, wait_s=900):
+    """Drop a message in a live session's inbox; stream replies as they land."""
+    import uuid
+    mid = uuid.uuid4().hex[:12]
+    reply_path = f"/tmp/coordreply-{mid}"
+    payload = {"id": mid, "content": msg, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "from": f"claude-coordinate@{os.path.basename(os.getcwd())}",
+               "reply_to": reply_path}
+    tmp = os.path.join(chan["inbox"], f".{mid}.tmp")
+    dst = os.path.join(chan["inbox"], f"msg-{mid}.json")
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.rename(tmp, dst)  # atomic: the watcher never sees a partial file
+    print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); waiting for reply "
+          f"(Ctrl-C stops waiting, message stays delivered){C['reset']}", file=sys.stderr)
+    deadline = time.time() + wait_s
+    pos = 0
+    got = False
+    try:
+        while time.time() < deadline:
+            try:
+                with open(reply_path) as f:
+                    f.seek(pos)
+                    for line in f:
+                        try:
+                            print(json.loads(line)["text"])
+                            got = True
+                        except (ValueError, KeyError):
+                            pass
+                    pos = f.tell()
+            except FileNotFoundError:
+                pass
+            if got:
+                # Give a moment for an immediate follow-up reply, then return.
+                time.sleep(2)
+                try:
+                    with open(reply_path) as f:
+                        f.seek(pos)
+                        for line in f:
+                            try:
+                                print(json.loads(line)["text"])
+                            except (ValueError, KeyError):
+                                pass
+                except FileNotFoundError:
+                    pass
+                return True
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    print(f"{C['yellow']}delivered, but no reply within {wait_s}s — the session may still answer; "
+          f"check `claude-coordinate watch` or {reply_path}{C['reset']}", file=sys.stderr)
+    return True
+
+
+def cmd_send(args):
+    # Prefer a LIVE channel: the message appears inside the running session's
+    # TUI instantly (like a Telegram message) and its reply streams back.
+    msg = " ".join(args.message)
+    t = args.target.lower()
+    for chan in live_channels():
+        if t in (chan.get("cwd") or "").lower() or t in str(chan.get("pid")):
+            send_via_channel(chan, msg)
+            return
+    # Target may be a session id whose project has a live channel.
+    try:
+        r0 = resolve(args.target)
+        for chan in live_channels():
+            if chan.get("cwd") and chan["cwd"] == r0.get("cwd"):
+                send_via_channel(chan, msg)
+                return
+    except SystemExit:
+        raise
+    r = r0
+    if r["busy"] and not args.force:
+        sys.exit(f"session {r['sid'][:8]} was written to {age(r['mtime'])} ago — likely mid-turn.\n"
+                 f"Sending now could interleave with the active writer. Re-run with --force to override.")
+    print(f"{C['dim']}-> {r['sid'][:8]} ({r['cwd']}): {msg[:120]}{C['reset']}", file=sys.stderr)
+    out = subprocess.run(
+        ["claude", "-p", "--resume", r["sid"], msg],
+        cwd=r["cwd"] or os.path.expanduser("~"), capture_output=True, text=True, timeout=1800)
+    if out.returncode != 0:
+        sys.exit(f"claude exited {out.returncode}: {out.stderr.strip()[:500]}")
+    print(out.stdout.strip())
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="claude-coordinate", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("list", help="recent sessions, freshest first")
+    p.add_argument("-n", type=int, default=15)
+    p.add_argument("--all", action="store_true", help="include sessions older than 7 days")
+    p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("watch", help="live pretty-printed feed of a session (or --all)")
+    p.add_argument("target", nargs="?", default="--all")
+    p.add_argument("--all", action="store_true", help="one feed for every session on the machine")
+    p.add_argument("--history", type=int, default=10, help="turns of backlog to show first")
+    p.add_argument("--thinking", action="store_true", help="include thinking excerpts")
+    p.add_argument("--no-follow", action="store_true", help="print backlog and exit")
+    p.set_defaults(fn=cmd_watch)
+    p = sub.add_parser("send", help="append a message to a session and print the reply")
+    p.add_argument("target")
+    p.add_argument("message", nargs="+")
+    p.add_argument("--force", action="store_true", help="send even if the session looks mid-turn")
+    p.set_defaults(fn=cmd_send)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

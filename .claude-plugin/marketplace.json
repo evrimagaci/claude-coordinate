@@ -1,0 +1,12 @@
+{
+  "name": "claude-coordinate",
+  "description": "Local cross-session coordination for Claude Code: live messaging between independently started sessions, session discovery, and a machine-wide live transcript feed.",
+  "owner": { "name": "Evrim Ağacı", "url": "https://github.com/evrimagaci" },
+  "plugins": [
+    {
+      "name": "coordinate-channel",
+      "description": "Local coordination channel — lets other Claude Code sessions on this machine message this session live (Telegram-channel mechanics over the local filesystem). Pairs with the claude-coordinate CLI.",
+      "source": "./coordinate-channel"
+    }
+  ]
+}

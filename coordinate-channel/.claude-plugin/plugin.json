@@ -1,0 +1,6 @@
+{
+  "name": "coordinate-channel",
+  "description": "Local cross-session coordination channel for Claude Code (pairs with the claude-coordinate CLI).",
+  "version": "0.1.0",
+  "keywords": ["channel", "coordination", "multi-agent", "mcp"]
+}
