@@ -1,0 +1,13 @@
+# Optional reply forwarder (Linux, systemd user unit). Install:
+#   mkdir -p ~/.config/systemd/user && cp systemd/coordinate-replies.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now coordinate-replies.service
+[Unit]
+Description=coordinate: deliver replies to the sending session's inbox (claude-coordinate forward)
+
+[Service]
+ExecStart=%h/.local/bin/claude-coordinate forward
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

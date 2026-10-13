@@ -30,7 +30,7 @@ open in different projects. This does.
 | Piece | What it does |
 |---|---|
 | `coordinate-channel` (plugin) | An MCP **channel** server: messages from other sessions appear *inside* the running session's TUI within ~2 s and are answered as normal turns, with replies routed back to the sender. Same harness mechanism as the official Telegram channel, but the transport is your local filesystem. |
-| `claude-coordinate` (CLI) | `list` sessions on the machine (who's active, where, doing what) · `watch <target>` / `watch --all` — live, read-only pretty-printed feed of any session's conversation · `send <target> "msg"` — message a session and stream back its reply. |
+| `claude-coordinate` (CLI) | `list` sessions on the machine (who's active, where, doing what) · `watch <target>` / `watch --all` — live, read-only pretty-printed feed of any session's conversation · `send <target> "msg"` — message a session and stream back its reply · `forward` — optional reply forwarder (see below). |
 | `/coordinate` (skill) | Teaches any Claude session to use the CLI: `/coordinate <task>` makes it pick the right peer session, brief it, iterate, and report back. |
 
 Sessions **without** the channel are still reachable: `send` falls back to a
@@ -83,7 +83,8 @@ live channel and falls back to transcript resume.
   dependency-free lines; ten minutes, no excuses. The launch confirmation
   prompt is per-session and intentional.
 - **Replies are path-constrained** (the channel will only write reply files
-  under `/tmp/` or its own state dir), the sender CLI refuses to resume-write
+  under `/tmp/` or its own state dir; the forwarder writes only into channel
+  inboxes under that state dir), the sender CLI refuses to resume-write
   a session that was active in the last 90 s (anti-interleave guard), and dead
   sessions are dropped from the registry automatically.
 - **Transcripts contain secrets** (tool output echoes env vars, tokens…).
@@ -110,7 +111,15 @@ directory. `claude-coordinate send` drops a JSON message file there (atomic
 rename, unique names — concurrent senders can't collide); the server pushes
 `notifications/claude/channel` and the Claude Code harness injects it as a
 live turn. The session answers through the channel's `reply` tool, which
-appends to the sender's unique reply file; the sender streams it. Discovery
+appends to the sender's unique reply file; the sender streams it.
+
+Optional reply forwarder: run `claude-coordinate forward` as one background
+loop for the machine (systemd user unit in `systemd/`). Then a `send` from
+inside a session that has the channel does not wait: the CLI records the
+message under `pending/`, and the forwarder delivers every reply to it,
+late ones and follow-ups included, into the sender's own inbox as a channel
+message, until the sender exits or a day passes. Without the forwarder, or
+from a plain shell, `send` waits and streams replies as before. Discovery
 (`list`) and viewing (`watch`) read Claude Code's own append-only session
 transcripts — read-only by construction.
 

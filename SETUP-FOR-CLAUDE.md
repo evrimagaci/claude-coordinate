@@ -46,7 +46,7 @@ nothing beyond what the README promises (local files only; no network code;
 replies path-constrained to `/tmp` and the channel state dir):
 
 - `~/.claude/claude-coordinate/coordinate-channel/server.js` (~190 lines)
-- `~/.claude/claude-coordinate/bin/claude-coordinate` (~400 lines of Python)
+- `~/.claude/claude-coordinate/bin/claude-coordinate` (~470 lines of Python)
 
 If anything contradicts the README, STOP and show the user.
 
@@ -64,6 +64,17 @@ the user's shell rc and tell them.
 
 Requirements check: `python3 --version` (3.9+), `node --version` (18+),
 Linux or macOS.
+
+Optional, Linux with systemd: install the reply forwarder. With it, a `send`
+from a channel session returns at once and every reply, late ones included,
+arrives in that session as a channel message:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/.claude/claude-coordinate/systemd/coordinate-replies.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now coordinate-replies.service
+systemctl --user is-active coordinate-replies.service   # verify: active
+```
 
 ## 4. Register the channel server (user scope)
 
@@ -104,7 +115,8 @@ sleep 8; tmux send-keys -t coordselftest Enter; sleep 6; tmux send-keys -t coord
 until ls ~/.claude/channels/coordinate/sessions/*.json >/dev/null 2>&1; do sleep 3; done
 # round-trip:
 claude-coordinate send coordinate-selftest "Reply via the coordinate reply tool with exactly: CHANNEL OK"
-# expect the line: CHANNEL OK
+# expect the line: CHANNEL OK (if this session has the channel and the forwarder
+# runs, the reply arrives here as a channel message instead)
 tmux kill-session -t coordselftest
 ```
 
@@ -147,6 +159,8 @@ the caveats from step 0.
 
 ```bash
 claude mcp remove -s user coordinate
+systemctl --user disable --now coordinate-replies.service 2>/dev/null
+rm -f ~/.config/systemd/user/coordinate-replies.service
 rm -f ~/.local/bin/claude-coordinate
 rm -rf ~/.claude/skills/coordinate ~/.claude/claude-coordinate ~/.claude/channels/coordinate
 ```
