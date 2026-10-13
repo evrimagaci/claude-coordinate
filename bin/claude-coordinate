@@ -17,6 +17,10 @@ Usage:
   claude-coordinate list [-n N] [--all]
   claude-coordinate watch <target> [--history N] [--thinking] [--no-follow]
   claude-coordinate send <target> <message...> [--force]
+  claude-coordinate forward      the coordinate-replies.service loop
+
+A `send` from inside a session that has the coordinate channel does not wait for the reply: the forwarder
+delivers each reply, late ones and follow-ups included, to that session as a channel message.
 """
 import argparse
 import glob
@@ -26,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$")
@@ -264,6 +269,39 @@ def cmd_watch(args):
 
 
 CHANNEL_STATE = os.path.expanduser("~/.claude/channels/coordinate")
+PENDING = os.path.join(CHANNEL_STATE, "pending")  # sent messages whose replies the forwarder delivers
+ALIVE = os.path.join(PENDING, ".alive")            # the forwarder touches it every loop
+
+
+def write_json(path, obj):
+    """Atomic: the inbox watcher and the forwarder never read a partial file."""
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f)
+    os.rename(path + ".tmp", path)
+
+
+def drop(inbox, content, frm, reply_to=None):
+    """One message into a channel inbox; returns its id."""
+    mid = uuid.uuid4().hex[:12]
+    write_json(os.path.join(inbox, f"msg-{mid}.json"),
+               {"id": mid, "content": content, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "from": frm,
+                **({"reply_to": reply_to} if reply_to else {})})
+    return mid
+
+
+def own_claude_pid():
+    """The claude session this command runs under (the ancestor of its Bash tool), or None from a plain shell."""
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read()
+        except OSError:
+            return None
+        if st[st.index("(") + 1:st.rindex(")")] == "claude":
+            return pid
+        pid = int(st[st.rindex(")") + 2:].split()[1])
+    return None
 
 
 def live_channels():
@@ -282,18 +320,20 @@ def live_channels():
 
 
 def send_via_channel(chan, msg, wait_s=900):
-    """Drop a message in a live session's inbox; stream replies as they land."""
-    import uuid
-    mid = uuid.uuid4().hex[:12]
-    reply_path = f"/tmp/coordreply-{mid}"
-    payload = {"id": mid, "content": msg, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "from": f"claude-coordinate@{os.path.basename(os.getcwd())}",
-               "reply_to": reply_path}
-    tmp = os.path.join(chan["inbox"], f".{mid}.tmp")
-    dst = os.path.join(chan["inbox"], f"msg-{mid}.json")
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-    os.rename(tmp, dst)  # atomic: the watcher never sees a partial file
+    """Drop a message in a live session's inbox. A sender with its own channel gets the replies there through
+    the forwarder; any other sender sees them streamed here as they land."""
+    reply_path = f"/tmp/coordreply-{uuid.uuid4().hex[:12]}"
+    me = own_claude_pid()
+    if me and os.path.isdir(os.path.join(CHANNEL_STATE, "inbox", str(me))) \
+            and os.path.exists(ALIVE) and time.time() - os.path.getmtime(ALIVE) < 30:
+        write_json(os.path.join(PENDING, reply_path[5:] + ".json"),
+                   {"reply_to": reply_path, "from_pid": me, "to": os.path.basename(chan["cwd"]),
+                    "gist": " ".join(msg.split())[:80], "sent": time.time(), "pos": 0})
+        drop(chan["inbox"], msg, f"claude-coordinate@{os.path.basename(os.getcwd())}", reply_path)
+        print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); its replies come back to this session "
+              f"as channel messages{C['reset']}", file=sys.stderr)
+        return True
+    drop(chan["inbox"], msg, f"claude-coordinate@{os.path.basename(os.getcwd())}", reply_path)
     print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); waiting for reply "
           f"(Ctrl-C stops waiting, message stays delivered){C['reset']}", file=sys.stderr)
     deadline = time.time() + wait_s
@@ -335,13 +375,51 @@ def send_via_channel(chan, msg, wait_s=900):
     return True
 
 
+def cmd_forward(args):
+    """Deliver each new reply to a pending message into its sender's inbox, until the sender exits or a day
+    passes. One loop for the whole machine (coordinate-replies.service)."""
+    os.makedirs(PENDING, exist_ok=True)
+    while True:
+        open(ALIVE, "w").close()
+        for f in glob.glob(os.path.join(PENDING, "*.json")):
+            try:
+                p = json.load(open(f))
+                inbox = os.path.join(CHANNEL_STATE, "inbox", str(p["from_pid"]))
+                os.kill(p["from_pid"], 0)
+                if not os.path.isdir(inbox) or time.time() - p["sent"] > 86400:
+                    raise ProcessLookupError
+            except (OSError, ValueError, KeyError):  # sender gone, entry expired or unreadable
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+                continue
+            try:
+                with open(p["reply_to"], "rb") as r:
+                    r.seek(p["pos"])
+                    chunk = r.read()
+            except OSError:  # no reply yet
+                continue
+            lines = chunk[:chunk.rfind(b"\n") + 1].splitlines(keepends=True)  # whole lines only
+            for raw in lines:
+                p["pos"] += len(raw)
+                try:
+                    text = json.loads(raw)["text"]
+                except (ValueError, KeyError):
+                    continue
+                drop(inbox, f'Reply from {p["to"]} to your message "{p["gist"]}": {text}', f"coordinate-reply@{p['to']}")
+            if lines:
+                write_json(f, p)
+        time.sleep(2)
+
+
 def cmd_send(args):
     # Prefer a LIVE channel: the message appears inside the running session's
     # TUI instantly (like a Telegram message) and its reply streams back.
     msg = " ".join(args.message)
     t = args.target.lower()
     for chan in live_channels():
-        if t in (chan.get("cwd") or "").lower() or t in str(chan.get("pid")):
+        if t in (chan.get("cwd") or "").lower() or t == str(chan.get("pid")):
             send_via_channel(chan, msg)
             return
     # Target may be a session id whose project has a live channel.
@@ -386,6 +464,8 @@ def main():
     p.add_argument("message", nargs="+")
     p.add_argument("--force", action="store_true", help="send even if the session looks mid-turn")
     p.set_defaults(fn=cmd_send)
+    p = sub.add_parser("forward", help="deliver replies to senders' inboxes (coordinate-replies.service)")
+    p.set_defaults(fn=cmd_forward)
     args = ap.parse_args()
     args.fn(args)
 

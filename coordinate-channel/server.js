@@ -42,12 +42,16 @@ function claudeCwd() {
 // process's command line (it was launched with `…-channels server:coordinate`);
 // COORDINATE_CHANNEL=1/0 overrides for platforms without /proc (e.g. macOS,
 // where you should launch channel sessions with COORDINATE_CHANNEL=1).
+// A session can also load this file as a plugin (CLAUDE_PLUGIN_ROOT set). Both
+// copies share one inbox, and the harness shows only the channel copy's
+// notifications, so a plugin copy that drained the inbox would eat messages:
+// each copy claims the inbox only when the flag names it.
 function detectChannelMode() {
   if (process.env.COORDINATE_CHANNEL === '1') return true;
   if (process.env.COORDINATE_CHANNEL === '0') return false;
   try {
     const cmdline = fs.readFileSync(`/proc/${CLAUDE_PID}/cmdline`, 'utf8');
-    return cmdline.includes('server:coordinate');
+    return cmdline.includes(process.env.CLAUDE_PLUGIN_ROOT ? 'plugin:coordinate-channel' : 'server:coordinate');
   } catch {
     return false;
   }
@@ -62,7 +66,8 @@ if (IS_CHANNEL) {
   }, null, 2));
 }
 
-function cleanup() {
+function cleanup() {  // only the copy that registered may unregister: never a sibling's or a successor's
+  try { if (JSON.parse(fs.readFileSync(REG, 'utf8')).serverPid !== process.pid) return; } catch { return; }
   try { fs.unlinkSync(REG); } catch {}
   try { fs.rmSync(INBOX, { recursive: true, force: true }); } catch {}
 }
