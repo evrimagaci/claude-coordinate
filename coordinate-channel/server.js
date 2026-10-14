@@ -121,7 +121,11 @@ function handle(msg) {
         if (!target.startsWith('/tmp/') && !target.startsWith(STATE)) {
           throw new Error(`reply_to outside allowed dirs: ${target}`);
         }
-        fs.appendFileSync(target, JSON.stringify({ text: String(args.text || ''), ts: new Date().toISOString() }) + '\n');
+        // Models sometimes name the field `message`; take either, and refuse an empty reply so the
+        // sender never receives a blank one.
+        const text = String(args.text ?? args.message ?? '');
+        if (!text.trim()) throw new Error('empty reply: put your reply in the `text` field');
+        fs.appendFileSync(target, JSON.stringify({ text, ts: new Date().toISOString() }) + '\n');
         out = { content: [{ type: 'text', text: 'reply delivered' }] };
       } catch (e) {
         out = { content: [{ type: 'text', text: `reply failed: ${e.message}` }], isError: true };
