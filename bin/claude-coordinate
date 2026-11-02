@@ -566,6 +566,18 @@ def check_sender(sender):
             sys.exit(f"--from {sender}: that is live session pid {pid}; --from is for scripts without a claude")
 
 
+def known(t, chans, home):
+    """True when `t` already names main, a fleet bot, a pid, a live channel's folder or a session (cmd_send's and
+    resolve()'s matches), so a nickname never shadows an exact name."""
+    if t in ("main", os.path.basename(home).lower(), home.lower(), home.lower() + "/") or t.isdigit() \
+            or names(t) & set(bots()):
+        return True
+    if any(t in (c.get("cwd") or "").lower() for c in chans):
+        return True
+    return any(r["sid"].startswith(t) or t in os.path.basename(r["path"]).lower() or t in (r["cwd"] or "").lower()
+               or t in os.path.dirname(r["path"]).lower() for r in collect(include_stale=True))
+
+
 def cmd_send(args):
     if args.sender:
         check_sender(args.sender)
@@ -575,6 +587,12 @@ def cmd_send(args):
     t = args.target.lower()
     chans = live_channels()
     home = os.path.expanduser("~")
+    # A bot's nickname ("video bot" = studio-bot, org.toml [nicknames]) names it when nothing else does, as in fleet msg
+    # (cio-bot 11-01 20:03). `org nick` prints an unknown word unchanged.
+    if not known(t, chans, home):
+        n = subprocess.run(["org", "nick", args.target], capture_output=True, text=True, timeout=30).stdout.strip()
+        if n and n.lower() != t:
+            args.target, t = n, n.lower()
     send = lambda c: send_via_channel(c, msg, wait=not args.no_wait, one_way=args.one_way, frm=args.sender)
     # "main", "cmb" (the home folder's name) or the home path is cmb's main session, as `org main` finds it (in tmux or
     # not). Bots that also run in ~ (bot-ops, bot-gpu) must not catch its messages. No main: exit 1, the caller queues.
