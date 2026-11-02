@@ -6,9 +6,11 @@ transcripts under ~/.claude/projects/. `send` appends a turn to a session via
 `claude -p --resume` (context-aware continuation) and prints the reply.
 
 Targets are resolved as:
+  0. "main", "cmb" (or the home path): cmb's main session as `org main` finds it (none: exit 1); then a live
+     channel by exact cwd or pid, folder name, or a substring of the cwd under ~ that names one project, else
   1. a session UUID or unique UUID prefix (across all projects), else
   2. a substring of the project directory path (e.g. "browser-orchestrator",
-     "my-api-project") -> the most recently active session in that project.
+     "bibaskavideo") -> the most recently active session in that project.
 
 Konsole tab names are NOT addressable (no tab->session mapping exists);
 use the project name instead.
@@ -16,7 +18,8 @@ use the project name instead.
 Usage:
   claude-coordinate list [-n N] [--all]
   claude-coordinate watch <target> [--history N] [--thinking] [--no-follow]
-  claude-coordinate send <target> <message...> [--force]
+  claude-coordinate send <target> <message...> [--force] [--no-wait] [--one-way] [--from NAME]
+                 exit 75: retry later (a bot's or main's channel is down, or the session is mid-turn)
   claude-coordinate forward      the coordinate-replies.service loop
 
 A `send` from inside a session that has the coordinate channel does not wait for the reply: the forwarder
@@ -32,7 +35,12 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, "/mnt/ssd2/projects/org/bin")
+import orgmain  # the one rule for "which session is main" (org main, fleet connection review 2026-10-24)
+
 PROJECTS = os.path.expanduser("~/.claude/projects")
+BOTS_TSV = os.path.expanduser("~/.config/fleet/bots.tsv")
+ALIASES = os.path.expanduser("~/.config/fleet/aliases.tsv")   # old, new, until (0: never expires)
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$")
 # A transcript written to within this window counts as "actively in use".
 BUSY_WINDOW_S = 90
@@ -131,7 +139,62 @@ def resolve(target):
             or t in os.path.dirname(r["path"]).lower()]
     if not hits:
         sys.exit(f"no session matches {target!r} (try `claude-coordinate list`)")
-    return hits[0]  # rows already sorted: freshest session in that project
+    # A path names the project's own session, not a fleet bot that works in the same folder: since bot-ops
+    # (2026-10-20) a message to /home/cmb went to the freshest session there, a bot, instead of cmb's main tab.
+    # Bots are addressed by session id (fleet msg), so they rank last here. Rows are already freshest first.
+    sids = set(bots().values())
+    return min(hits, key=lambda r: r["sid"] in sids)
+
+
+def bots():
+    """{name: session id} of the fleet bots (bots.tsv columns 1 and 4)."""
+    try:
+        return {l.split("\t")[0]: l.split("\t")[3][:36] for l in open(BOTS_TSV) if l.count("\t") >= 3}
+    except OSError:
+        return {}
+
+
+def names(name):
+    """Every name of the bot `name` names: its renames' old and new names (fleet's aliases.tsv, both ways), so a
+    message finds a renamed bot by its old name, and a bot fleet renamed by its new name while its claude still runs
+    under the old -n until its fresh start (bot-org, COO titles, 2026-10-26: renames run one bot at a time)."""
+    try:
+        rows = [l.rstrip("\n").split("\t") for l in open(ALIASES)]
+    except OSError:
+        rows = []
+    now, out, grew = time.time(), {name}, True
+    pairs = [(r[0].lower(), r[1].lower()) for r in rows
+             if len(r) >= 3 and r[2].isdigit() and (r[2] == "0" or int(r[2]) > now)]
+    while grew:
+        grew = False
+        for a, b in pairs:
+            if (a in out) != (b in out):
+                out |= {a, b}; grew = True
+    return out
+
+
+def dash_n(pid):
+    """The -n name a claude process runs under, or ''."""
+    a = orgmain.cmdline(pid)
+    return a[a.index(b"-n") + 1].decode().lower() if b"-n" in a[:-1] else ""
+
+
+def fleet_name(pid):
+    """A process's name in messages: its fleet bot (-n), "main", its tmux session, else its folder's name. Not the
+    folder alone: bot-ops, bot-gpu and main all run in ~ and all signed as "cmb" (fleet connection review 2026-10-24)."""
+    if (n := dash_n(pid)) and (cur := names(n) & set(bots())):   # a renamed bot signs with its current name
+        return n if n in cur else min(cur)
+    if orgmain.is_main(pid):
+        return "main"
+    try:
+        env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        pane = next((e[10:].decode() for e in env if e.startswith(b"TMUX_PANE=")), "")
+        if pane and (s := subprocess.run(["tmux", "display", "-p", "-t", pane, "#S"],
+                                         capture_output=True, text=True).stdout.strip()):
+            return s
+        return os.path.basename(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return str(pid)
 
 
 def age(ts):
@@ -280,8 +343,15 @@ def write_json(path, obj):
     os.rename(path + ".tmp", path)
 
 
+def placeholder(text):
+    """A reply that is literally the word "placeholder" carries nothing; senders took it as an answer (fleet review)."""
+    return text.strip().strip(".").lower() == "placeholder"
+
+
 def drop(inbox, content, frm, reply_to=None):
     """One message into a channel inbox; returns its id."""
+    if placeholder(content):
+        sys.exit("refused: the message is the word 'placeholder', not a reply")
     mid = uuid.uuid4().hex[:12]
     write_json(os.path.join(inbox, f"msg-{mid}.json"),
                {"id": mid, "content": content, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "from": frm,
@@ -319,21 +389,53 @@ def live_channels():
     return out
 
 
-def send_via_channel(chan, msg, wait_s=900):
+def channel_sid(chan):
+    """The session id a live channel's claude process runs: <config dir>/sessions/<pid>.json, where the config
+    dir is the process's CLAUDE_CONFIG_DIR (cswap slots) or ~/.claude."""
+    pid = str(chan.get("pid"))
+    try:
+        env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        cfg = next((e[18:].decode() for e in env if e.startswith(b"CLAUDE_CONFIG_DIR=")), "") \
+            or os.path.expanduser("~/.claude")
+        return json.load(open(os.path.join(cfg, "sessions", f"{pid}.json"))).get("sessionId", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def send_via_channel(chan, msg, wait_s=900, wait=True, one_way=False, frm=None):
     """Drop a message in a live session's inbox. A sender with its own channel gets the replies there through
-    the forwarder; any other sender sees them streamed here as they land."""
-    reply_path = f"/tmp/coordreply-{uuid.uuid4().hex[:12]}"
+    the forwarder; any other sender sees them streamed here as they land. one_way: a notice, no reply_to."""
     me = own_claude_pid()
+    frm = f"claude-coordinate@{frm or fleet_name(me or os.getpid())}"
+    if one_way:
+        drop(chan["inbox"], msg, frm)
+        print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); delivered, one way{C['reset']}", file=sys.stderr)
+        return True
+    reply_path = f"/tmp/coordreply-{uuid.uuid4().hex[:12]}"
     if me and os.path.isdir(os.path.join(CHANNEL_STATE, "inbox", str(me))) \
             and os.path.exists(ALIVE) and time.time() - os.path.getmtime(ALIVE) < 30:
+        # One reply_to per topic: a follow-up on the same [job <board>] to the same session reuses its reply file, so
+        # the receiver answers one thread and the forwarder keeps one pending row.
+        to, topic = fleet_name(chan["pid"]), (m.group(0) if (m := re.search(r"\[job [^\]]+\]", msg)) else None)
+        row = {"reply_to": reply_path, "from_pid": me, "to": to, "topic": topic, "pos": 0}
+        for f in glob.glob(os.path.join(PENDING, "*.json")) if topic else ():
+            try:
+                p = json.load(open(f))
+            except (OSError, ValueError):
+                continue
+            if (p.get("from_pid"), p.get("to"), p.get("topic")) == (me, to, topic):
+                row, reply_path = p, p["reply_to"]
+                break
         write_json(os.path.join(PENDING, reply_path[5:] + ".json"),
-                   {"reply_to": reply_path, "from_pid": me, "to": os.path.basename(chan["cwd"]),
-                    "gist": " ".join(msg.split())[:80], "sent": time.time(), "pos": 0})
-        drop(chan["inbox"], msg, f"claude-coordinate@{os.path.basename(os.getcwd())}", reply_path)
+                   {**row, "gist": " ".join(msg.split())[:80], "sent": time.time()})
+        drop(chan["inbox"], msg, frm, reply_path)
         print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); its replies come back to this session "
               f"as channel messages{C['reset']}", file=sys.stderr)
         return True
-    drop(chan["inbox"], msg, f"claude-coordinate@{os.path.basename(os.getcwd())}", reply_path)
+    drop(chan["inbox"], msg, frm, reply_path)
+    if not wait:   # --no-wait: a script sender (the pipeline, fleet msg) needs delivery only (bot-ops, 2026-10-21)
+        print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); delivered{C['reset']}", file=sys.stderr)
+        return True
     print(f"{C['dim']}-> live channel pid {chan['pid']} ({chan['cwd']}); waiting for reply "
           f"(Ctrl-C stops waiting, message stays delivered){C['reset']}", file=sys.stderr)
     deadline = time.time() + wait_s
@@ -379,8 +481,10 @@ def cmd_forward(args):
     """Deliver each new reply to a pending message into its sender's inbox, until the sender exits or a day
     passes. One loop for the whole machine (coordinate-replies.service)."""
     os.makedirs(PENDING, exist_ok=True)
+    beat_at = 0
     while True:
         open(ALIVE, "w").close()
+        behind = []
         for f in glob.glob(os.path.join(PENDING, "*.json")):
             try:
                 p = json.load(open(f))
@@ -407,34 +511,156 @@ def cmd_forward(args):
                     text = json.loads(raw)["text"]
                 except (ValueError, KeyError):
                     continue
+                if placeholder(text):  # sessions that run an older reply tool can still write one
+                    continue
                 drop(inbox, f'Reply from {p["to"]} to your message "{p["gist"]}": {text}', f"coordinate-reply@{p['to']}")
             if lines:
                 write_json(f, p)
+            if os.path.getsize(p["reply_to"]) > p["pos"]:
+                behind.append(os.path.basename(p["reply_to"]))
+        if time.time() - beat_at >= 60:
+            # Loop kit wave 2 (cio-bot/loopkit-wave2-tooling): an org loop beat a minute; progress holds still while a
+            # reply waits undelivered. fleet checks from outside that no pending reply line stays undelivered.
+            beat_at = time.time()
+            try:
+                import orgloop
+                orgloop.beat("coord-forward", "tooling-bot", "60s", "15m",
+                             f"behind: {','.join(sorted(behind))}" if behind else f"clear {int(beat_at)}",
+                             what="claude-coordinate forward: deliver each reply to its sender's inbox")
+            except Exception:
+                pass
         time.sleep(2)
 
 
+def held(b):
+    """fleet hold: the bot is parked until the epoch in its .hold file; fleet msg queues its messages till then."""
+    try:
+        return int(open(os.path.expanduser(f"~/.local/state/fleet/{b}.hold")).read().strip() or 0) > time.time()
+    except (OSError, ValueError):
+        return False
+
+
+def stuck(b):
+    """fleet's stuck rule: its message wake did not start; fleet retries from its watch pass, so messages queue meanwhile."""
+    return os.path.exists(os.path.expanduser(f"~/.local/state/fleet/{b}.wakefail"))
+
+
+def to_held(b, msg, sender):
+    """A held or stuck bot's message goes through fleet msg: it queues there (an [urgent] line from main or cto-bot
+    wakes a held one)."""
+    if sender:
+        os.environ["FLEET_FROM"] = sender
+    os.execvp("fleet", ["fleet", "msg", b, msg])
+
+
+def check_sender(sender):
+    """--from names a script without a claude. A live claude session's name (main above all, also when main is down)
+    belongs to that session only: browser-bot takes a job from main as cmb's (cio-bot 2026-11-01, org PR #1201)."""
+    me = own_claude_pid()
+    s = names(sender.lower().removeprefix("claude-coordinate@"))
+    if s & {"main", "cmb"} and not (me and orgmain.is_main(me)):
+        sys.exit(f"--from {sender}: only main sends as main")
+    m = orgmain.get()
+    for pid in {int(c["pid"]) for c in live_channels()} | ({int(m["pid"])} if m else set()):
+        if pid != me and names(fleet_name(pid).lower()) & s:
+            sys.exit(f"--from {sender}: that is live session pid {pid}; --from is for scripts without a claude")
+
+
+def known(t, chans, home):
+    """True when `t` already names main, a fleet bot, a pid, a live channel's folder or a session (cmd_send's and
+    resolve()'s matches), so a nickname never shadows an exact name."""
+    if t in ("main", os.path.basename(home).lower(), home.lower(), home.lower() + "/") or t.isdigit() \
+            or names(t) & set(bots()):
+        return True
+    if any(t in (c.get("cwd") or "").lower() for c in chans):
+        return True
+    return any(r["sid"].startswith(t) or t in os.path.basename(r["path"]).lower() or t in (r["cwd"] or "").lower()
+               or t in os.path.dirname(r["path"]).lower() for r in collect(include_stale=True))
+
+
 def cmd_send(args):
+    if args.sender:
+        check_sender(args.sender)
     # Prefer a LIVE channel: the message appears inside the running session's
     # TUI instantly (like a Telegram message) and its reply streams back.
     msg = " ".join(args.message)
     t = args.target.lower()
-    for chan in live_channels():
-        if t in (chan.get("cwd") or "").lower() or t == str(chan.get("pid")):
-            send_via_channel(chan, msg)
+    chans = live_channels()
+    home = os.path.expanduser("~")
+    # A bot's nickname ("video bot" = studio-bot, org.toml [nicknames]) names it when nothing else does, as in fleet msg
+    # (cio-bot 11-01 20:03). `org nick` prints an unknown word unchanged.
+    if not known(t, chans, home):
+        n = subprocess.run(["org", "nick", args.target], capture_output=True, text=True, timeout=30).stdout.strip()
+        if n and n.lower() != t:
+            args.target, t = n, n.lower()
+    send = lambda c: send_via_channel(c, msg, wait=not args.no_wait, one_way=args.one_way, frm=args.sender)
+    # "main", "cmb" (the home folder's name) or the home path is cmb's main session, as `org main` finds it (in tmux or
+    # not). Bots that also run in ~ (bot-ops, bot-gpu) must not catch its messages. No main: exit 1, the caller queues.
+    if t in ("main", os.path.basename(home).lower(), home.lower(), home.lower() + "/"):
+        if not (m := orgmain.get()):
+            sys.exit("no main (org main finds none): queue the message and retry; never guess")
+        send({"pid": m["pid"], "inbox": m["inbox"], "cwd": home})
+        return
+    # A fleet bot's name, old or new, is the claude that runs under any of its names (fleet msg does the same by pid).
+    if (ns := names(t)) & set(bots()):
+        if hits := [c for c in chans if dash_n(c.get("pid")) in ns]:
+            send(hits[0])
             return
-    # Target may be a session id whose project has a live channel.
-    try:
-        r0 = resolve(args.target)
-        for chan in live_channels():
-            if chan.get("cwd") and chan["cwd"] == r0.get("cwd"):
-                send_via_channel(chan, msg)
-                return
-    except SystemExit:
-        raise
-    r = r0
-    if r["busy"] and not args.force:
-        sys.exit(f"session {r['sid'][:8]} was written to {age(r['mtime'])} ago — likely mid-turn.\n"
-                 f"Sending now could interleave with the active writer. Re-run with --force to override.")
+        b = min(ns & set(bots()))
+        if held(b) or stuck(b):
+            to_held(b, msg, args.sender)
+        if os.path.exists(os.path.expanduser(f"~/.local/state/fleet/{b}.parked")):
+            subprocess.Popen(["fleet", "resume", b], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"{b} is parked: fleet resumes it now (up to 2 min). Retry then.", file=sys.stderr)
+        else:
+            print(f"{b} has no live coordinate channel; retry later (or fleet msg {b})", file=sys.stderr)
+        sys.exit(75)
+    # An exact cwd or pid beats a folder name, which beats a substring. The substring skips the home prefix ("cmb" is
+    # in every cwd under ~: 'send cmb' went to bot-gpu, 2026-10-20 and 10-22) and must name one project.
+    cwd = lambda c: (c.get("cwd") or "").lower().rstrip("/")
+    for match in (lambda c: t == cwd(c) or t == str(c.get("pid")),
+                  lambda c: t == os.path.basename(cwd(c)),
+                  lambda c: t in cwd(c).removeprefix(home.lower()).lstrip("/")):
+        if hits := [c for c in chans if match(c)]:
+            if len(dirs := sorted({cwd(c) for c in hits})) > 1:
+                sys.exit(f"{args.target!r} matches {len(dirs)} projects; name one: {', '.join(dirs)}")
+            send(hits[0])
+            return
+    if t.isdigit():  # a pid whose channel is down (fleet's claude_pid): retry later, not a session-id guess
+        print(f"pid {t} has no live coordinate channel; retry later", file=sys.stderr)
+        sys.exit(75)
+    # Target may be a session id whose project has a live channel. Several sessions can share a folder, so
+    # take the channel whose process runs that very session; the folder alone decides only when one is there.
+    r = resolve(args.target)
+    chans = [c for c in live_channels() if c.get("cwd") and c["cwd"] == r.get("cwd")]
+    own = [c for c in chans if channel_sid(c) == r["sid"]]
+    # a fleet bot's session goes only to its own claude, never to another session in its folder (main 2026-10-28 19:31:
+    # a message to parked ops-bot in ~ landed in main's channel)
+    if own or (len(chans) == 1 and r["sid"] not in bots().values()):
+        send((own or chans)[0])
+        return
+    if chans:
+        sys.exit(f"{len(chans)} live sessions share {r['cwd']} and none runs {r['sid'][:8]}; "
+                 f"send by pid: {', '.join(str(c['pid']) for c in chans)}")
+    # A bot's or main's session runs in its own claude: `claude -p --resume` would be a second writer on its transcript.
+    # Its channel is down, so the caller retries later (exit 75).
+    if parked := [n for n, s in bots().items() if s == r["sid"] and os.path.exists(os.path.expanduser(f"~/.local/state/fleet/{n}.parked"))]:
+        if held(parked[0]) or stuck(parked[0]):
+            to_held(parked[0], msg, args.sender)
+        # fleet parked it (12 h with no turn): wake it on its own session; the caller's retry finds its channel up
+        subprocess.Popen(["fleet", "resume", parked[0]], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"{parked[0]} is parked: fleet resumes it now (up to 2 min). Retry then.", file=sys.stderr)
+        sys.exit(75)
+    if r["sid"] in bots().values() or r["sid"] == ((orgmain.get() or {}).get("sid")):
+        print(f"session {r['sid'][:8]} is a fleet bot's or main's and its channel is down; never resumed with "
+              f"claude -p. Retry later.", file=sys.stderr)
+        sys.exit(75)
+    if r["busy"] and not args.force:   # exit 75 (EX_TEMPFAIL): try again later; a caller's retry is the cure (bot-ops 10-23)
+        print(f"session {r['sid'][:8]} was written to {age(r['mtime'])} ago — likely mid-turn.\n"
+              f"Sending now could interleave with the active writer. Re-run with --force to override.", file=sys.stderr)
+        sys.exit(75)
     print(f"{C['dim']}-> {r['sid'][:8]} ({r['cwd']}): {msg[:120]}{C['reset']}", file=sys.stderr)
     out = subprocess.run(
         ["claude", "-p", "--resume", r["sid"], msg],
@@ -463,6 +689,9 @@ def main():
     p.add_argument("target")
     p.add_argument("message", nargs="+")
     p.add_argument("--force", action="store_true", help="send even if the session looks mid-turn")
+    p.add_argument("--no-wait", action="store_true", help="return once delivered to a live channel; do not wait for the reply")
+    p.add_argument("--one-way", action="store_true", help="a notice: no reply_to, no reply expected (notifier pushes)")
+    p.add_argument("--from", dest="sender", help="sender name for a script without a claude or tmux (default: fleet name)")
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser("forward", help="deliver replies to senders' inboxes (coordinate-replies.service)")
     p.set_defaults(fn=cmd_forward)
